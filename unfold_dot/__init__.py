@@ -16,7 +16,7 @@ def reference_unfold_dot(q, k, restrict):
     k = k.view(n_batch, h, d_k, restrict, -1).permute(0, 1, 4, 2, 3)
     # (batch, head, time1, 1, d_k) x (batch, head, time1, d_k, self.restrict) -> (batch, head, time1, 1, self.restrict)
     scores = q.unsqueeze(-2).matmul(k) # / math.sqrt(self.d_k)
-    return scores
+    return scores.squeeze(3)
 
 
 class UnfoldDotFunction(Function):
@@ -26,6 +26,8 @@ class UnfoldDotFunction(Function):
 
     def forward(self, q, k):
         import unfold_dot_cuda
+        q = q.contiguous()
+        k = k.contiguous()
         ret = unfold_dot_cuda.unfold_dot_cuda_forward(q, k, self.restrict)
         self.save_for_backward(q, k)
         return ret
@@ -33,6 +35,7 @@ class UnfoldDotFunction(Function):
     def backward(self, dret):
         import unfold_dot_cuda
         q, k = self.saved_variables
+        dret = dret.contiguous()
         dq, dk = unfold_dot_cuda.unfold_dot_cuda_backward(dret, q, k)
         return dq, dk
 
@@ -46,7 +49,7 @@ class UnfoldDot(nn.Module):
     def forward(self, q, k):
         assert q.shape[2] == k.shape[2], "restricted attention is not implemented for source attention now"
         if self.faster and q.is_cuda and k.is_cuda:
-            return UnfoldDotFunction(self.restrict)(q, k).unsqueeze(3)
+            return UnfoldDotFunction(self.restrict)(q, k)
         else:
             return reference_unfold_dot(q, k, self.restrict)
 
@@ -123,7 +126,7 @@ class MultiHeadedAttention(nn.Module):
             v = v.view(n_batch, self.h, self.d_k, self.restrict, -1).transpose(2, 4)
             # (batch, head, time1, 1, d_k) x (batch, head, time1, d_k, self.restrict) -> (batch, head, time1, 1, self.restrict)
             # scores = q.unsqueeze(-2).matmul(k) / math.sqrt(self.d_k)
-            scores = unfold_dot(q, k, self.restrict) / math.sqrt(self.d_k)
+            scores = unfold_dot(q, k, self.restrict).unsqueeze(3) / math.sqrt(self.d_k)
             if mask is not None:
                 mask = mask.unsqueeze(-1).unsqueeze(-1)
                 self.attn_ = torch.softmax(scores, dim = -1)  # (batch, head, time1, time2)

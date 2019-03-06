@@ -7,6 +7,36 @@
 
 namespace {
 
+    template <typename T, int N>
+    struct Stride {
+        T* data;
+        ptrdiff_t strides[N];
+
+        Stride(at::Tensor t) {
+            this->data = t.data<T>();
+            for (int n = 0; n < N; ++n) {
+                this->strides[n] = t.stride(n);
+            }
+        }
+
+        __host__ __device__
+        T* pointer(std::initializer_list<ptrdiff_t> il) {
+            return const_cast<T*>(static_cast<const Stride<T, N>&>(*this).pointer(il));
+        }
+
+        __host__ __device__
+        const T* pointer(std::initializer_list<ptrdiff_t> il) const {
+            ptrdiff_t ret = 0;
+            int n = 0;
+            for (auto i : il) {
+                ret += i * this->strides[n];
+                ++n;
+            }
+            return data + ret;
+        }
+
+    };
+
 #define PARALLEL_FOR(i, n) \
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); i += blockDim.x * gridDim.x)
 
@@ -16,30 +46,71 @@ namespace {
         const scalar_t* __restrict__ query, // (batch, head, time1, feat)
         const scalar_t* __restrict__ key,   // (batch, head, time2, feat)
         size_t restrict_size,
-        size_t batch_head_size,
+
+        size_t batch_size,
+        ptrdiff_t batch_ret_stride,
+        ptrdiff_t batch_query_stride,
+        ptrdiff_t batch_key_stride,
+
+        size_t head_size,
+        ptrdiff_t head_ret_stride,
+        ptrdiff_t head_query_stride,
+        ptrdiff_t head_key_stride,
+
         size_t time_query,
+        ptrdiff_t time_ret_stride,
+        ptrdiff_t time_query_stride,
+        ptrdiff_t time_key_stride,
+
         size_t time_key,
+
         size_t feat_size,
+        ptrdiff_t ret_restrict_stride,
+        ptrdiff_t feat_query_stride,
+        ptrdiff_t feat_key_stride,
+
+        Stride<scalar_t, 4> ret_tensor,
+        const Stride<scalar_t, 4> query_tensor,
+        const Stride<scalar_t, 4> key_tensor,
+
         size_t parallel_size
         ) {
         const ptrdiff_t window = (restrict_size - 1) / 2;
         PARALLEL_FOR(i, parallel_size) {
-            const ptrdiff_t batch_head_index = i / time_query;
+            const ptrdiff_t batch_index = i / (head_size * time_query);
+            const ptrdiff_t head_index = (i % (head_size * time_query)) / time_query;
             const ptrdiff_t time_query_index = i % time_query;
 
-            scalar_t* ret_i = ret + batch_head_index * time_query * restrict_size + time_query_index * restrict_size;
-            const scalar_t* query_i = query + batch_head_index * time_query * feat_size + time_query_index * feat_size;
-            const scalar_t* key_i = key + batch_head_index * time_key * feat_size + time_query_index * feat_size;
+            // pointer to (batch, head, time)
+            // scalar_t* ret_i = ret +
+            //     batch_index * batch_ret_stride +
+            //     head_index * head_ret_stride +
+            //     time_query_index * time_ret_stride;
+
+            auto* ret_i = ret_tensor.pointer({batch_index, head_index, time_query_index, 0});
+            const auto* query_i = query_tensor.pointer({batch_index, head_index, time_query_index, 0});
+            const auto* key_i = key_tensor.pointer({batch_index, head_index, time_query_index, 0});
+
+            // const scalar_t* query_i = query +
+            //     batch_index * batch_query_stride +
+            //     head_index * head_query_stride +
+            //     time_query_index * time_query_stride;
+            // const scalar_t* key_i = key +
+            //     batch_index * batch_key_stride +
+            //     head_index * head_key_stride +
+            //     time_query_index * time_key_stride;
 
             for (ptrdiff_t w = -window; w <= window; ++w) {
                 const ptrdiff_t time_key_index = time_query_index + w;
                 if (time_key_index < 0) continue;
                 if (time_key_index >= time_key) break;
 
-                ret_i[w + window] = 0;
+                // TODO parallel reduction
+                scalar_t acc = 0;
                 for (ptrdiff_t f = 0; f < feat_size; ++f) {
-                    ret_i[w + window] += query_i[f] * key_i[w * feat_size + f];
+                    acc += query_i[f * feat_query_stride] * key_i[w * time_key_stride + f * feat_key_stride];
                 }
+                ret_i[(w + window) * ret_restrict_stride] = acc;
             }
         }
     }
@@ -114,10 +185,33 @@ at::Tensor unfold_dot_cuda_forward(
                     query.data<scalar_t>(),
                     key.data<scalar_t>(),
                     restrict_size,
-                    batch * head,
+
+                    batch,
+                    ret.stride(0),
+                    query.stride(0),
+                    key.stride(0),
+
+                    head,
+                    ret.stride(1),
+                    query.stride(1),
+                    key.stride(1),
+
                     query.size(2),
+                    ret.stride(2),
+                    query.stride(2),
+                    key.stride(2),
+
                     key.size(2),
+
                     feat,
+                    ret.stride(3),
+                    query.stride(3),
+                    key.stride(3),
+
+                    Stride<scalar_t, 4>(ret),
+                    Stride<scalar_t, 4>(query),
+                    Stride<scalar_t, 4>(key),
+
                     parallel_size);
             }));
 
