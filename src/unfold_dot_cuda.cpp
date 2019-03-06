@@ -1,6 +1,6 @@
 #include <torch/torch.h>
 
-#include <vector>
+#include <array>
 
 // CUDA forward declarations
 
@@ -10,7 +10,7 @@ at::Tensor unfold_dot_cuda_forward(
     int64_t restrict
     );
 
-std::vector<at::Tensor> unfold_dot_cuda_backward(
+std::array<at::Tensor, 2> unfold_dot_cuda_backward(
     at::Tensor dret,            // (batch, head, time1, restrict)
     at::Tensor query,           // (batch, head, time1, feat)
     at::Tensor key              // (batch, head, time2, feat)

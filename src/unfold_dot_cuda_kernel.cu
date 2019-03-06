@@ -3,7 +3,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include <vector>
+#include <array>
 
 namespace {
 
@@ -22,22 +22,22 @@ namespace {
         size_t feat_size,
         size_t parallel_size
         ) {
-        const int window = (restrict_size - 1) / 2;
+        const ptrdiff_t window = (restrict_size - 1) / 2;
         PARALLEL_FOR(i, parallel_size) {
-            const int batch_head_index = i / time_query;
-            const int time_query_index = i % time_query;
+            const ptrdiff_t batch_head_index = i / time_query;
+            const ptrdiff_t time_query_index = i % time_query;
 
             scalar_t* ret_i = ret + batch_head_index * time_query * restrict_size + time_query_index * restrict_size;
             const scalar_t* query_i = query + batch_head_index * time_query * feat_size + time_query_index * feat_size;
             const scalar_t* key_i = key + batch_head_index * time_key * feat_size + time_query_index * feat_size;
 
-            for (int w = -window; w <= window; ++w) {
-                const int time_key_index = time_query_index + w;
+            for (ptrdiff_t w = -window; w <= window; ++w) {
+                const ptrdiff_t time_key_index = time_query_index + w;
                 if (time_key_index < 0) continue;
                 if (time_key_index >= time_key) break;
 
                 ret_i[w + window] = 0;
-                for (int f = 0; f < feat_size; ++f) {
+                for (ptrdiff_t f = 0; f < feat_size; ++f) {
                     ret_i[w + window] += query_i[f] * key_i[w * feat_size + f];
                 }
             }
@@ -59,30 +59,32 @@ namespace {
         size_t feat_size,
         size_t parallel_size
         ) {
-        const int window = (restrict_size - 1) / 2;
+        const ptrdiff_t window = (restrict_size - 1) / 2;
+        const ptrdiff_t rev_offset = restrict_size - 1 - window;
         // parallel for each (batch, head, time1, feat). sequential for each (restrict)
         PARALLEL_FOR(i, parallel_size) {
-            const int batch_head_index = i / (time_query * feat_size);
-            const int remain = i % (time_query * feat_size);
-            const int time_query_index = remain / feat_size;
-            const int f = remain % feat_size;
+            const ptrdiff_t batch_head_index = i / (time_query * feat_size);
+            const ptrdiff_t remain = i % (time_query * feat_size);
+            const ptrdiff_t time_query_index = remain / feat_size;
+            const ptrdiff_t f = remain % feat_size;
 
-            const scalar_t* query_i = query + batch_head_index * time_query * feat_size + time_query_index * feat_size;
-            const scalar_t* key_i = key + batch_head_index * time_key * feat_size + time_query_index * feat_size;
+            // poautoer to (batch, head, time1)
             const scalar_t* dret_i = dret + batch_head_index * time_query * restrict_size + time_query_index * restrict_size;
-            scalar_t* dquery_i = dquery + batch_head_index * time_query * feat_size + time_query_index * feat_size;
-            scalar_t* dkey_i = dkey + batch_head_index * time_key * feat_size + time_query_index * feat_size;
+            // poautoer to (batch, head, time1, feat)
+            const scalar_t* query_i = query + batch_head_index * time_query * feat_size + time_query_index * feat_size + f;
+            const scalar_t* key_i = key + batch_head_index * time_key * feat_size + time_query_index * feat_size + f;
+            scalar_t* dquery_i = dquery + batch_head_index * time_query * feat_size + time_query_index * feat_size + f;
+            scalar_t* dkey_i = dkey + batch_head_index * time_key * feat_size + time_query_index * feat_size + f;
 
-            // TODO: parallel for each f
-            dquery_i[f] = 0;
-            dkey_i[f] = 0;
-            for (int w = -window; w <= window; ++w) {
-                const int time_key_index = time_query_index + w;
-                if (time_key_index < 0) continue;
-                if (time_key_index >= time_key) break;
-                
-                dquery_i[f] += dret_i[w + window] * key_i[w * feat_size + f];
-                dkey_i[f] += dret_i[w + window] * query_i[w * feat_size + f];
+            *dquery_i = 0;
+            *dkey_i = 0;
+            // for (auto w = -min(time_query_index, window); w <= min(time_query - time_query_index + 1, window); ++w) {
+            for (auto w = -window; w <= window; ++w) {
+                auto t = time_query_index + w;
+                if (0 <= t && t < time_key) {
+                    *dquery_i += dret_i[w + window] * key_i[w * feat_size];
+                    *dkey_i += dret_i[w * restrict_size + (rev_offset - w)] * query_i[w * feat_size];
+                }
             }
         }
     }
@@ -123,7 +125,7 @@ at::Tensor unfold_dot_cuda_forward(
 }
 
 
-std::vector<at::Tensor> unfold_dot_cuda_backward(
+std::array<at::Tensor, 2> unfold_dot_cuda_backward(
     at::Tensor dret,            // (batch, head, time1, restrict)
     at::Tensor query,           // (batch, head, time1, feat)
     at::Tensor key              // (batch, head, time2, feat)
