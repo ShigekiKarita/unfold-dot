@@ -88,16 +88,28 @@ namespace {
     __global__ void unfold_dot_cuda_backward_kernel(
         scalar_t* __restrict__ dquery, // (batch, head, time1, feat)
         scalar_t* __restrict__ dkey,   // (batch, head, time2, feat)
-        const scalar_t* __restrict__ dret,  // (batch, head, time1, restrict)
-        const scalar_t* __restrict__ query, // (batch, head, time1, feat)
-        const scalar_t* __restrict__ key,   // (batch, head, time2, feat)
-        size_t restrict_size,
-        size_t batch_head_size,
-        size_t time_query,
-        size_t time_key,
-        size_t feat_size,
+        // const scalar_t* __restrict__ dret,  // (batch, head, time1, restrict)
+        // const scalar_t* __restrict__ query, // (batch, head, time1, feat)
+        // const scalar_t* __restrict__ key,   // (batch, head, time2, feat)
+
+        // Stride<scalar_t, 4> dquery_tensor,
+        // Stride<scalar_t, 4> dkey_tensor,
+        const Stride<scalar_t, 4> dret_tensor,
+        const Stride<scalar_t, 4> query_tensor,
+        const Stride<scalar_t, 4> key_tensor,
+
         size_t parallel_size
         ) {
+
+        const auto batch_size = dret_tensor.sizes[0];
+        const auto head_size = dret_tensor.sizes[1];
+        const auto time_query = query_tensor.sizes[2];
+        const auto time_key = key_tensor.sizes[2];
+        const auto feat_size = query_tensor.sizes[3];
+        const auto restrict_size = dret_tensor.sizes[3];
+
+        const auto batch_head_size = batch_size * head_size;
+
         const ptrdiff_t window = (restrict_size - 1) / 2;
         const ptrdiff_t rev_offset = restrict_size - 1 - window;
         // parallel for each (batch, head, time1, feat). sequential for each (restrict)
@@ -105,26 +117,38 @@ namespace {
             const ptrdiff_t batch_head_index = i / (time_query * feat_size);
             const ptrdiff_t remain = i % (time_query * feat_size);
             const ptrdiff_t time_query_index = remain / feat_size;
-            const ptrdiff_t f = remain % feat_size;
+            const ptrdiff_t feat_index = remain % feat_size;
+            const ptrdiff_t batch_index = batch_head_index / head_size;
+            const ptrdiff_t head_index = batch_head_index % head_size;
+
+            const auto* dret_i = dret_tensor.pointer({batch_index, head_index, time_query_index, 0});
+            const auto* query_i = query_tensor.pointer({batch_index, head_index, time_query_index, feat_index});
+            const auto* key_i = key_tensor.pointer({batch_index, head_index, time_query_index, feat_index});
+
+            // FIXME
+            // scalar_t* dquery_i = dquery_tensor.pointer({batch_index, head_index, time_query_index, feat_index});
+            // scalar_t* dkey_i = dkey_tensor.pointer({batch_index, head_index, time_query_index, feat_index});
 
             // poautoer to (batch, head, time1)
-            const scalar_t* dret_i = dret + batch_head_index * time_query * restrict_size + time_query_index * restrict_size;
+            // const scalar_t* dret_i = dret + batch_head_index * time_query * restrict_size + time_query_index * restrict_size;
             // poautoer to (batch, head, time1, feat)
-            const scalar_t* query_i = query + batch_head_index * time_query * feat_size + time_query_index * feat_size + f;
-            const scalar_t* key_i = key + batch_head_index * time_key * feat_size + time_query_index * feat_size + f;
-            scalar_t* dquery_i = dquery + batch_head_index * time_query * feat_size + time_query_index * feat_size + f;
-            scalar_t* dkey_i = dkey + batch_head_index * time_key * feat_size + time_query_index * feat_size + f;
+            // const scalar_t* query_i = query + batch_head_index * time_query * feat_size + time_query_index * feat_size + feat_index;
+            // const scalar_t* key_i = key + batch_head_index * time_key * feat_size + time_query_index * feat_size + feat_index;
 
-            *dquery_i = 0;
-            *dkey_i = 0;
+            scalar_t dquery_i = 0;
+            scalar_t dkey_i = 0;
             // for (auto w = -min(time_query_index, window); w <= min(time_query - time_query_index + 1, window); ++w) {
             for (auto w = -window; w <= window; ++w) {
                 auto t = time_query_index + w;
                 if (0 <= t && t < time_key) {
-                    *dquery_i += dret_i[w + window] * key_i[w * feat_size];
-                    *dkey_i += dret_i[w * restrict_size + (rev_offset - w)] * query_i[w * feat_size];
+                    dquery_i += dret_i[(w + window) * dret_tensor.strides[3]] * key_i[w * key_tensor.strides[2]];
+                    dkey_i += dret_i[w * dret_tensor.strides[2] + (rev_offset - w) * dret_tensor.strides[3]]
+                        * query_i[w * query_tensor.strides[2]];
                 }
             }
+            dquery[batch_head_index * time_query * feat_size + time_query_index * feat_size + feat_index] = dquery_i;
+            dkey[batch_head_index * time_key * feat_size + time_query_index * feat_size + feat_index] = dkey_i;
+
         }
     }
 
@@ -182,14 +206,15 @@ std::array<at::Tensor, 2> unfold_dot_cuda_backward(
                 unfold_dot_cuda_backward_kernel<scalar_t><<<blocks, threads>>>(
                     dquery.data<scalar_t>(),
                     dkey.data<scalar_t>(),
-                    dret.data<scalar_t>(),
-                    query.data<scalar_t>(),
-                    key.data<scalar_t>(),
-                    restrict_size,
-                    batch * head,
-                    query.size(2),
-                    key.size(2),
-                    feat,
+                    // dret.data<scalar_t>(),
+                    // query.data<scalar_t>(),
+                    // key.data<scalar_t>(),
+
+                    // Stride<scalar_t, 4>(dquery),
+                    // Stride<scalar_t, 4>(dkey),
+                    Stride<scalar_t, 4>(dret),
+                    Stride<scalar_t, 4>(query),
+                    Stride<scalar_t, 4>(key),
                     parallel_size);
             }));
 
