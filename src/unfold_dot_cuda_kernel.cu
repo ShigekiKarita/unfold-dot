@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <assert.h>
 
 namespace {
 
@@ -11,11 +12,13 @@ namespace {
     struct Stride {
         T* data;
         ptrdiff_t strides[N];
+        ptrdiff_t sizes[N];
 
         Stride(at::Tensor t) {
             this->data = t.data<T>();
             for (int n = 0; n < N; ++n) {
                 this->strides[n] = t.stride(n);
+                this->sizes[n] = t.size(n);
             }
         }
 
@@ -29,6 +32,8 @@ namespace {
             ptrdiff_t ret = 0;
             int n = 0;
             for (auto i : il) {
+                assert(0 <= i);
+                assert(i < this->sizes[n]);
                 ret += i * this->strides[n];
                 ++n;
             }
@@ -42,63 +47,26 @@ namespace {
 
     template <typename scalar_t>
     __global__ void unfold_dot_cuda_forward_kernel(
-        scalar_t* __restrict__ ret,         // (batch, head, time1, restrict)
-        const scalar_t* __restrict__ query, // (batch, head, time1, feat)
-        const scalar_t* __restrict__ key,   // (batch, head, time2, feat)
-        size_t restrict_size,
-
-        size_t batch_size,
-        ptrdiff_t batch_ret_stride,
-        ptrdiff_t batch_query_stride,
-        ptrdiff_t batch_key_stride,
-
-        size_t head_size,
-        ptrdiff_t head_ret_stride,
-        ptrdiff_t head_query_stride,
-        ptrdiff_t head_key_stride,
-
-        size_t time_query,
-        ptrdiff_t time_ret_stride,
-        ptrdiff_t time_query_stride,
-        ptrdiff_t time_key_stride,
-
-        size_t time_key,
-
-        size_t feat_size,
-        ptrdiff_t ret_restrict_stride,
-        ptrdiff_t feat_query_stride,
-        ptrdiff_t feat_key_stride,
-
-        Stride<scalar_t, 4> ret_tensor,
-        const Stride<scalar_t, 4> query_tensor,
-        const Stride<scalar_t, 4> key_tensor,
-
+        Stride<scalar_t, 4> ret_tensor,         // (batch, head, time1, restrict)
+        const Stride<scalar_t, 4> query_tensor, // (batch, head, time1, feat)
+        const Stride<scalar_t, 4> key_tensor,   // (batch, head, time2, feat)
         size_t parallel_size
         ) {
+        const auto batch_size = ret_tensor.sizes[0];
+        const auto head_size = ret_tensor.sizes[1];
+        const auto time_query = query_tensor.sizes[2];
+        const auto time_key = key_tensor.sizes[2];
+        const auto feat_size = query_tensor.sizes[3];
+        const auto restrict_size = ret_tensor.sizes[3];
         const ptrdiff_t window = (restrict_size - 1) / 2;
         PARALLEL_FOR(i, parallel_size) {
             const ptrdiff_t batch_index = i / (head_size * time_query);
             const ptrdiff_t head_index = (i % (head_size * time_query)) / time_query;
             const ptrdiff_t time_query_index = i % time_query;
 
-            // pointer to (batch, head, time)
-            // scalar_t* ret_i = ret +
-            //     batch_index * batch_ret_stride +
-            //     head_index * head_ret_stride +
-            //     time_query_index * time_ret_stride;
-
             auto* ret_i = ret_tensor.pointer({batch_index, head_index, time_query_index, 0});
             const auto* query_i = query_tensor.pointer({batch_index, head_index, time_query_index, 0});
             const auto* key_i = key_tensor.pointer({batch_index, head_index, time_query_index, 0});
-
-            // const scalar_t* query_i = query +
-            //     batch_index * batch_query_stride +
-            //     head_index * head_query_stride +
-            //     time_query_index * time_query_stride;
-            // const scalar_t* key_i = key +
-            //     batch_index * batch_key_stride +
-            //     head_index * head_key_stride +
-            //     time_query_index * time_key_stride;
 
             for (ptrdiff_t w = -window; w <= window; ++w) {
                 const ptrdiff_t time_key_index = time_query_index + w;
@@ -108,9 +76,9 @@ namespace {
                 // TODO parallel reduction
                 scalar_t acc = 0;
                 for (ptrdiff_t f = 0; f < feat_size; ++f) {
-                    acc += query_i[f * feat_query_stride] * key_i[w * time_key_stride + f * feat_key_stride];
+                    acc += query_i[f * query_tensor.strides[3]] * key_i[w * key_tensor.strides[2] + f * key_tensor.strides[3]];
                 }
-                ret_i[(w + window) * ret_restrict_stride] = acc;
+                ret_i[(w + window) * ret_tensor.strides[3]] = acc;
             }
         }
     }
@@ -181,33 +149,6 @@ at::Tensor unfold_dot_cuda_forward(
 
     AT_DISPATCH_FLOATING_TYPES(ret.type(), "unfold_dot_forward_cuda", ([&] {
                 unfold_dot_cuda_forward_kernel<scalar_t><<<blocks, threads>>>(
-                    ret.data<scalar_t>(),
-                    query.data<scalar_t>(),
-                    key.data<scalar_t>(),
-                    restrict_size,
-
-                    batch,
-                    ret.stride(0),
-                    query.stride(0),
-                    key.stride(0),
-
-                    head,
-                    ret.stride(1),
-                    query.stride(1),
-                    key.stride(1),
-
-                    query.size(2),
-                    ret.stride(2),
-                    query.stride(2),
-                    key.stride(2),
-
-                    key.size(2),
-
-                    feat,
-                    ret.stride(3),
-                    query.stride(3),
-                    key.stride(3),
-
                     Stride<scalar_t, 4>(ret),
                     Stride<scalar_t, 4>(query),
                     Stride<scalar_t, 4>(key),
