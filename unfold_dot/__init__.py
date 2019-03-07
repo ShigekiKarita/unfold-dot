@@ -62,6 +62,64 @@ def unfold_dot(q, k, restrict):
     return UnfoldDot(restrict)(q, k)
 
 
+def reference_unfold_matmul(a, v):
+    """
+    Arguments:
+      a: (batch, head, time, restrict)
+      v: (batch, head, time, feat) -> will be windowed (unfolded) to (batch, head, time, restrict, feat)
+    Returns:
+      (batch, head, time, feat)
+    """
+    restrict = a.shape[-1]
+    batch, head, time, feat = v.shape
+    assert a.shape == (batch, head, time, restrict)
+    unfold = torch.nn.Unfold(kernel_size=(restrict, 1), stride=(1, 1), padding=(restrict // 2, 0))
+    v = unfold(v.transpose(2, 3).contiguous().view(batch, head * feat, -1, 1))
+    v = v.view(batch, head, feat, restrict, time).transpose(2, 4)  # (batch, head, time, restrict, feat)
+    # (b, h, t, 1, r) x (b, h, t, r, f) -> (b, h, t, 1, f)
+    return a.unsqueeze(3).matmul(v).squeeze(3)
+
+
+class UnfoldMatmulFunction(Function):
+    @staticmethod
+    def forward(ctx, a, v):
+        import unfold_dot_cuda
+        av = unfold_dot_cuda.unfold_matmul_cuda_forward(a, v)
+        ctx.save_for_backward(a, v)
+        return av
+
+    @staticmethod
+    def backward(ctx, dav):
+        import unfold_dot_cuda
+        a, v = ctx.saved_variables
+        da, dv = unfold_dot_cuda.unfold_matmul_cuda_backward(dav, a, v)
+        return da, dv
+
+
+class UnfoldMatmul(nn.Module):
+    def __init__(self, faster=True):
+        super().__init__()
+        self.faster = faster
+
+    def forward(self, a, v):
+        assert a.shape[:-1] == v.shape[:-1]
+        if self.faster and a.is_cuda and v.is_cuda:
+            return UnfoldMatmulFunction.apply(a, v)
+        else:
+            return reference_unfold_matmul(a, v)
+
+
+def unfold_matmul(a, v, faster=True):
+    """
+    Arguments:
+      a: (batch, head, time, restrict)
+      v: (batch, head, time, feat) -> will be windowed (unfolded) to (batch, head, time, restrict, feat)
+    Returns:
+      (batch, head, time, feat)
+    """
+    return UnfoldMatmul(faster)(a, v)
+
+
 class MultiHeadedAttention(nn.Module):
     def __init__(self, h, d_model, dropout, restrict=0):
         super(MultiHeadedAttention, self).__init__()

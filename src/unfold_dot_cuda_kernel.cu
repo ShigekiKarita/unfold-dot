@@ -262,7 +262,6 @@ at::Tensor unfold_dot_cuda_forward(
                     Stride<scalar_t, 4>(ret),
                     Stride<scalar_t, 4>(query),
                     Stride<scalar_t, 4>(key),
-
                     parallel_size);
             }));
 
