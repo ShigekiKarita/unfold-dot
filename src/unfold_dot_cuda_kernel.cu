@@ -12,21 +12,12 @@ namespace {
     template <typename T, int N>
     struct Stride {
         T* data;
-        // ptrdiff_t* strides;
-        // ptrdiff_t* sizes;
         ptrdiff_t strides[N];
         ptrdiff_t sizes[N];
-
-        // static const int bytes = sizeof(ptrdiff_t) * N;
 
         Stride(const at::Tensor& t) : data(t.data<T>()) {
             static_assert(sizeof(Stride<T, N>) < sizeof(void*) * 16,
                           "CUDA kernel launch will exeed resources");
-            // cudaMalloc(&strides, bytes);
-            // cudaMalloc(&sizes, bytes);
-            // cudaMemcpy(strides, t.strides().data(), bytes, cudaMemcpyHostToDevice);
-            // cudaMemcpy(sizes, t.sizes().data(), bytes, cudaMemcpyHostToDevice);
-
             std::copy(t.strides().begin(), t.strides().end(), strides);
             std::copy(t.sizes().begin(), t.sizes().end(), sizes);
         }
@@ -63,7 +54,6 @@ namespace {
         ) {
         const auto head_size = ret_tensor.sizes[1];
         const auto time_query = query_tensor.sizes[2];
-        const auto time_key = key_tensor.sizes[2];
         const auto feat_size = query_tensor.sizes[3];
         const auto restrict_size = ret_tensor.sizes[3];
         const ptrdiff_t window = (restrict_size - 1) / 2;
@@ -77,10 +67,8 @@ namespace {
             const auto* query_i = query_tensor.pointer({batch_index, head_index, time_query_index, 0});
             const auto* key_i = key_tensor.pointer({batch_index, head_index, time_query_index, 0});
 
-            for (ptrdiff_t w = -window; w <= window; ++w) {
-                const ptrdiff_t time_key_index = time_query_index + w;
-                if (time_key_index < 0) continue;
-                if (time_key_index >= time_key) break;
+            for (ptrdiff_t w = -min(time_query_index, window); w <= window; ++w) {
+                if (key_tensor.sizes[2] <= time_query_index + w) break;
 
                 // TODO parallel reduction
                 scalar_t acc = 0;
@@ -105,7 +93,6 @@ namespace {
     {
         const auto head_size = dret_tensor.sizes[1];
         const auto time_query = query_tensor.sizes[2];
-        const auto time_key = key_tensor.sizes[2];
         const auto feat_size = query_tensor.sizes[3];
         const auto restrict_size = dret_tensor.sizes[3];
 
@@ -127,14 +114,12 @@ namespace {
             scalar_t dquery_i = 0;
             scalar_t dkey_i = 0;
 
-            // for (auto w = -min(time_query_index, window); w <= min(time_query - time_query_index + 1, window); ++w) {
-            for (auto w = -window; w <= window; ++w) {
-                auto t = time_query_index + w;
-                if (0 <= t && t < time_key) {
-                    dquery_i += dret_i[(w + window) * dret_tensor.strides[3]] * key_i[w * key_tensor.strides[2]];
-                    dkey_i += dret_i[w * dret_tensor.strides[2] + (rev_offset - w) * dret_tensor.strides[3]]
-                        * query_i[w * query_tensor.strides[2]];
-                }
+            // TODO parallel reduction
+            for (auto w = -min(time_query_index, window); w <= window; ++w) {
+                if (key_tensor.sizes[2] <= time_query_index + w) break;
+                dquery_i += dret_i[(w + window) * dret_tensor.strides[3]] * key_i[w * key_tensor.strides[2]];
+                dkey_i += dret_i[w * dret_tensor.strides[2] + (rev_offset - w) * dret_tensor.strides[3]]
+                    * query_i[w * query_tensor.strides[2]];
             }
             *dquery_tensor.pointer({batch_index, head_index, time_query_index, feat_index}) = dquery_i;
             *dkey_tensor.pointer({batch_index, head_index, time_query_index, feat_index}) = dkey_i;
@@ -169,10 +154,8 @@ namespace {
 
             // TODO parallel reduction
             scalar_t acc = 0;
-            for (ptrdiff_t w = -window; w <= window; ++w) {
-                const ptrdiff_t time_value_index = time_query_index + w;
-                if (time_value_index < 0) continue;
-                if (time_value_index >= value.sizes[2]) break;
+            for (ptrdiff_t w = -min(time_query_index, window); w <= window; ++w) {
+                if (time_query_index + w >= value.sizes[2]) break;
 
                 acc += score_i[(w + window) * score.strides[3]] * value_i[w * value.strides[2]];
             }
@@ -215,6 +198,42 @@ namespace {
                 acc += dret_i[f * dret.strides[3]] * value_i[f * value.strides[3]];
             }
             *dscore.pointer({batch_index, head_index, time_query_index, restrict_index}) = acc;
+        }
+    }
+
+    template <typename scalar_t>
+    __global__ void unfold_matmul_cuda_backward_value_kernel(
+        Stride<scalar_t, 4> dvalue,      // (batch, head, time_query, feat)
+        const Stride<scalar_t, 4> dret,  // (batch, head, time_query, feat)
+        const Stride<scalar_t, 4> score, // (batch, head, time_value, restrict)
+        const size_t parallel_size
+        )
+    {
+        const auto head_size = score.sizes[1];
+        const auto time_query = score.sizes[2];
+        const auto restrict_size = score.sizes[3];
+        const auto feat_size = dvalue.sizes[3];
+        const ptrdiff_t window = (restrict_size - 1) / 2;
+
+        // parallel for batch, head, time_query, feat
+        PARALLEL_FOR(i, parallel_size) {
+            const ptrdiff_t batch_head_index = i / (time_query * feat_size);
+            const ptrdiff_t remain = i % (time_query * feat_size);
+            const ptrdiff_t time_query_index = remain / feat_size;
+            const ptrdiff_t feat_index = remain % feat_size;
+            const ptrdiff_t batch_index = batch_head_index / head_size;
+            const ptrdiff_t head_index = batch_head_index % head_size;
+
+            const auto dret_i = dret.pointer({batch_index, head_index, time_query_index, feat_index});
+            const auto score_i = score.pointer({batch_index, head_index, time_query_index, window});
+
+            // TODO parallel reduction
+            scalar_t acc = 0;
+            for (ptrdiff_t w = -min(time_query_index, window); w <= window; ++w) {
+                if (dret.sizes[2] <= time_query_index + w) break;
+                acc += dret_i[w * dret.strides[2]] * score_i[w * score.strides[2] - w * score.strides[3]];
+            }
+            *dvalue.pointer({batch_index, head_index, time_query_index, feat_index}) = acc;
         }
     }
 
@@ -273,7 +292,6 @@ std::array<at::Tensor, 2> unfold_dot_cuda_backward(
                 unfold_dot_cuda_backward_kernel<scalar_t><<<blocks, threads>>>(
                     Stride<scalar_t, 4>(dquery),
                     Stride<scalar_t, 4>(dkey),
-
                     Stride<scalar_t, 4>(dret),
                     Stride<scalar_t, 4>(query),
                     Stride<scalar_t, 4>(key),
@@ -314,18 +332,33 @@ std::array<at::Tensor, 2> unfold_matmul_cuda_backward(
 {
     auto dscore = at::zeros_like(score);
     auto dvalue = at::zeros_like(value);
-    // batch x head x time, restrict
-    const size_t parallel_size = dscore.size(0) * dscore.size(1) * dscore.size(2) * dscore.size(3);
-    const int threads = 1024;
-    const int blocks = (parallel_size + threads - 1) / threads;
+    {
+        // batch x head x time x restrict
+        const size_t parallel_size = dscore.size(0) * dscore.size(1) * dscore.size(2) * dscore.size(3);
+        const int threads = 1024;
+        const int blocks = (parallel_size + threads - 1) / threads;
 
-    AT_DISPATCH_FLOATING_TYPES(dscore.type(), "unfold_matmul_backward_cuda", ([&] {
-                unfold_matmul_cuda_backward_score_kernel<scalar_t><<<blocks, threads>>>(
-                    Stride<scalar_t, 4>(dscore),
-                    Stride<scalar_t, 4>(dret),
-                    Stride<scalar_t, 4>(value),
-                    parallel_size);
-            }));
+        AT_DISPATCH_FLOATING_TYPES(dscore.type(), "unfold_matmul_backward_score_cuda", ([&] {
+                    unfold_matmul_cuda_backward_score_kernel<scalar_t><<<blocks, threads>>>(
+                        Stride<scalar_t, 4>(dscore),
+                        Stride<scalar_t, 4>(dret),
+                        Stride<scalar_t, 4>(value),
+                        parallel_size);
+                }));
+    }
+    {
+        // batch x head x time x feat
+        const size_t parallel_size = dvalue.size(0) * dvalue.size(1) * dvalue.size(2) * dvalue.size(3);
+        const int threads = 1024;
+        const int blocks = (parallel_size + threads - 1) / threads;
 
+        AT_DISPATCH_FLOATING_TYPES(dvalue.type(), "unfold_matmul_backward_value_cuda", ([&] {
+                    unfold_matmul_cuda_backward_value_kernel<scalar_t><<<blocks, threads>>>(
+                        Stride<scalar_t, 4>(dvalue),
+                        Stride<scalar_t, 4>(dret),
+                        Stride<scalar_t, 4>(score),
+                        parallel_size);
+                }));
+    }
     return {dscore, dvalue};
 }

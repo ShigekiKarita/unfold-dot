@@ -10,8 +10,8 @@ setup(
                 'src/unfold_dot_cuda_kernel.cu',
             ],
             extra_compile_args={
-                "cxx": ["-Wall", "-Wextra"], # , "-O2"],
-                "nvcc": ['-Xcompiler="-Wall"', '-Xcompiler="-Wextra"'] # , '-Xcompiler="-O2"', "-O2"]}
+                "cxx": ["-Wall", "-Wextra", "-O2"],
+                "nvcc": ['-Xcompiler="-Wall"', '-Xcompiler="-Wextra"', '-Xcompiler="-O2"', "-O2"]
             }
         ),
     ],
