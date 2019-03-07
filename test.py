@@ -22,7 +22,7 @@ def reference_unfold_matmul(a, v):
     return a.unsqueeze(3).matmul(v).squeeze(3)
 
 
-for w in [1, 3]:
+for w in [1, 3, 5]:
     q = torch.randn(2, 5, 7, 6, requires_grad=True, device="cuda")
     k = torch.randn(2, 5, 7, 6, requires_grad=True, device="cuda")
 
@@ -49,7 +49,6 @@ for w in [1, 3]:
     # torch.testing.assert_allclose(s_ref, s)
 
 
-# FIXME: cuda gradcheck will fail (reference impl is good)
 q = torch.randn(2, 3, 7, 5, requires_grad=True, dtype=torch.double).cuda()
 k = torch.randn(2, 3, 7, 5, requires_grad=True, dtype=torch.double).cuda()
 func = unfold_dot.UnfoldDot(3, True)
