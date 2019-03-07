@@ -19,6 +19,7 @@ def reference_unfold_matmul(a, v):
     unfold = torch.nn.Unfold(kernel_size=(restrict, 1), stride=(1, 1), padding=(restrict // 2, 0))
     v = unfold(v.transpose(2, 3).contiguous().view(batch, head * feat, -1, 1))
     v = v.view(batch, head, feat, restrict, time).transpose(2, 4)  # (batch, head, time, restrict, feat)
+    # (b, h, t, 1, r) x (b, h, t, r, f) -> (b, h, t, 1, f)
     return a.unsqueeze(3).matmul(v).squeeze(3)
 
 
@@ -59,14 +60,21 @@ for w in [1, 3, 5]:
     torch.testing.assert_allclose(k.grad, dk)
 
 
-q = torch.randn(2, 3, 7, 5, requires_grad=True, dtype=torch.double).cuda()
-k = torch.randn(2, 3, 7, 5, requires_grad=True, dtype=torch.double).cuda()
+q = torch.randn(2, 3, 7, 5, requires_grad=True, device="cuda", dtype=torch.double)
+k = torch.randn(2, 3, 7, 5, requires_grad=True, device="cuda", dtype=torch.double)
 func = unfold_dot.UnfoldDot(3, True)
 assert gradcheck(func, [q, k], eps=1e-3) # , atol=1e-2, rtol=1e-2)
 
 
 # test matmul
 restrict = 3
-a = torch.randn(2, 3, 7, restrict, requires_grad=True, dtype=torch.double).cuda()
-v = torch.randn(2, 3, 7, 5, requires_grad=True, dtype=torch.double).cuda()
+a = torch.randn(2, 3, 7, restrict, requires_grad=True, device="cuda", dtype=torch.double)
+v = torch.randn(2, 3, 7, 5, requires_grad=True, device="cuda", dtype=torch.double)
 av_ref = reference_unfold_matmul(a, v)
+av = unfold_dot_cuda.unfold_matmul_cuda_forward(a, v)
+torch.testing.assert_allclose(av_ref, av)
+
+dav = torch.randn(*av.shape, device="cuda", dtype=torch.double)
+av_ref.backward(dav)
+da, dv = unfold_dot_cuda.unfold_matmul_cuda_backward(dav, a, v)
+torch.testing.assert_allclose(a.grad, da)
