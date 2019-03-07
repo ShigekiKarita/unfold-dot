@@ -37,16 +37,26 @@ for w in [1, 3, 5]:
     torch.testing.assert_allclose(q.grad, dq)
     torch.testing.assert_allclose(k.grad, dk)
 
-    # # test strided/non-contiguous tensors
-    # q = torch.randn(2, 6, 5, 7, requires_grad=True, device="cuda")
-    # k = torch.randn(2, 6, 5, 7, requires_grad=True, device="cuda")
-    # q = q.permute(0, 3, 1, 2)
-    # k = q.permute(0, 3, 1, 2)
-    # s_ref = unfold_dot.reference_unfold_dot(q.contiguous(), k.contiguous(), 3)
-    # s = unfold_dot_cuda.unfold_dot_cuda_forward(q, k, 3)
-    # print(s)
-    # print(s_ref)
-    # torch.testing.assert_allclose(s_ref, s)
+    # test strided/non-contiguous tensors
+    q = torch.randn(2, 6, 5, 7, device="cuda")
+    k = torch.randn(2, 5, 6, 7, device="cuda")
+    q = q.permute(0, 2, 3, 1)
+    assert not q.is_contiguous()
+    k = k.permute(0, 1, 3, 2)
+    assert not k.is_contiguous()
+    q.requires_grad = True
+    k.requires_grad = True
+    s_ref = unfold_dot.reference_unfold_dot(q, k, 3)
+    s = unfold_dot_cuda.unfold_dot_cuda_forward(q, k, 3)
+    torch.testing.assert_allclose(s_ref, s)
+    ds = torch.randn(*s.shape, device="cuda")
+    ds = ds.transpose(1, 2).contiguous()
+    ds = ds.transpose(1, 2)
+    assert not ds.is_contiguous()
+    s_ref.backward(ds)
+    dq, dk = unfold_dot_cuda.unfold_dot_cuda_backward(ds, q, k)
+    torch.testing.assert_allclose(q.grad, dq)
+    torch.testing.assert_allclose(k.grad, dk)
 
 
 q = torch.randn(2, 3, 7, 5, requires_grad=True, dtype=torch.double).cuda()

@@ -26,8 +26,6 @@ class UnfoldDotFunction(Function):
 
     def forward(self, q, k):
         import unfold_dot_cuda
-        q = q.contiguous()
-        k = k.contiguous()
         ret = unfold_dot_cuda.unfold_dot_cuda_forward(q, k, self.restrict)
         self.save_for_backward(q, k)
         return ret
@@ -35,7 +33,6 @@ class UnfoldDotFunction(Function):
     def backward(self, dret):
         import unfold_dot_cuda
         q, k = self.saved_variables
-        dret = dret.contiguous()
         dq, dk = unfold_dot_cuda.unfold_dot_cuda_backward(dret, q, k)
         return dq, dk
 
