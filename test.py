@@ -42,10 +42,10 @@ for w in [1, 3, 5]:
     torch.testing.assert_allclose(q.grad, dq)
     torch.testing.assert_allclose(k.grad, dk)
 
-q = torch.randn(2, 3, 7, 5, requires_grad=True, device="cuda", dtype=torch.double)
-k = torch.randn(2, 3, 7, 5, requires_grad=True, device="cuda", dtype=torch.double)
-func = unfold_dot.UnfoldDot(3, True)
-assert gradcheck(func, [q, k], eps=1e-3) # , atol=1e-2, rtol=1e-2)
+    q = torch.randn(2, 3, 7, 5, requires_grad=True, device="cuda", dtype=torch.double)
+    k = torch.randn(2, 3, 7, 5, requires_grad=True, device="cuda", dtype=torch.double)
+    func = unfold_dot.UnfoldDot(w, True)
+    assert gradcheck(func, [q, k], eps=1e-3) # , atol=1e-2, rtol=1e-2)
 
 
 # test matmul
@@ -86,8 +86,20 @@ for restrict in [1, 3, 5]:
     torch.testing.assert_allclose(a.grad, da)
     torch.testing.assert_allclose(v.grad, dv)
 
-restrict = 3
-a = torch.randn(2, 3, 7, restrict, requires_grad=True, device="cuda", dtype=torch.double)
-v = torch.randn(2, 3, 7, 5, requires_grad=True, device="cuda", dtype=torch.double)
-func = unfold_dot.UnfoldMatmul()
-assert gradcheck(func, [a, v], eps=1e-3)
+    a = torch.randn(2, 3, 7, restrict, requires_grad=True, device="cuda", dtype=torch.double)
+    v = torch.randn(2, 3, 7, 5, requires_grad=True, device="cuda", dtype=torch.double)
+    func = unfold_dot.UnfoldMatmul()
+    assert gradcheck(func, [a, v], eps=1e-3)
+
+
+
+
+mha = unfold_dot.MultiHeadedAttention(2, 6, 0.0, 3)
+mha.cuda()
+q = torch.randn(2, 5, 6, requires_grad=True, device="cuda")
+k = torch.randn(2, 5, 6, requires_grad=True, device="cuda")
+v = torch.randn(2, 5, 6, requires_grad=True, device="cuda")
+m = torch.ones(2, 5, dtype=torch.uint8, device="cuda")
+y_ref = mha.reference_forward(q, k, v, m)
+y = mha(q, k, v, m)
+torch.testing.assert_allclose(y_ref, y)

@@ -306,7 +306,16 @@ at::Tensor unfold_matmul_cuda_forward(
     at::Tensor value            // (batch, head, time, feat)
     )
 {
-    auto ret = at::empty_like(value);
+    // NOTE: reason of this transpose is the output `ret` will be transposed after this op
+    // TODO: add option like `bool transpose` or optional value `at::Tensor ret`
+    // (batch, time, head, feat) -> (batch, head, time, feat)
+    auto batch = value.size(0);
+    auto head = value.size(1);
+    auto time = value.size(2);
+    auto feat = value.size(3);
+    auto ret = at::empty({batch, time, head, feat}, value.options());
+    ret = ret.transpose(1, 2);
+
     const size_t parallel_size = ret.size(0) * ret.size(1) * ret.size(2) * ret.size(3);
     const int threads = 1024;
     const int blocks = (parallel_size + threads - 1) / threads;

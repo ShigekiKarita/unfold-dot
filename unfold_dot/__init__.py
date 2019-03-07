@@ -120,9 +120,9 @@ def unfold_matmul(a, v, faster=True):
     return UnfoldMatmul(faster)(a, v)
 
 
-class MultiHeadedAttention(nn.Module):
+class RefMultiHeadedAttention(nn.Module):
     def __init__(self, h, d_model, dropout, restrict=0):
-        super(MultiHeadedAttention, self).__init__()
+        super().__init__()
         assert d_model % h == 0
         # We assume d_v always equals d_k
         self.d_k = d_model // h
@@ -170,18 +170,19 @@ class MultiHeadedAttention(nn.Module):
         
         if self.restrict > 0:
             # TODO use stride or padding to make time2 equal to time1
+            scale = k.shape[2] // q.shape[2]
+            assert q.shape[2] == k.shape[2], "restricted attention is not implemented for source attention now"
             unfold = nn.Unfold(kernel_size=(self.restrict, 1), stride=(1, 1), padding=(self.restrict // 2, 0))
-            # # (batch, self.h * self.d_k * self.restrict, time2)
-            # k = unfold(k.transpose(2, 3).contiguous().view(n_batch, self.h * self.d_k, -1, 1))
-            # # (batch, self.h, time2, self.d_k, self.restrict)
-            # k = k.view(n_batch, self.h, self.d_k, self.restrict, -1).permute(0, 1, 4, 2, 3)
+            # (batch, self.h * self.d_k * self.restrict, time2)
+            k = unfold(k.transpose(2, 3).contiguous().view(n_batch, self.h * self.d_k, -1, 1))
+            # (batch, self.h, time2, self.d_k, self.restrict)
+            k = k.view(n_batch, self.h, self.d_k, self.restrict, -1).permute(0, 1, 4, 2, 3)
             # (batch, self.h * self.d_k * self.restrict, time2)
             v = unfold(v.transpose(2, 3).contiguous().view(n_batch, self.h * self.d_k, -1, 1))
             # (batch, self.h, time2, self.restrict, self.d_k)
             v = v.view(n_batch, self.h, self.d_k, self.restrict, -1).transpose(2, 4)
             # (batch, head, time1, 1, d_k) x (batch, head, time1, d_k, self.restrict) -> (batch, head, time1, 1, self.restrict)
-            # scores = q.unsqueeze(-2).matmul(k) / math.sqrt(self.d_k)
-            scores = unfold_dot(q, k, self.restrict).unsqueeze(3) / math.sqrt(self.d_k)
+            scores = q.unsqueeze(-2).matmul(k) / math.sqrt(self.d_k)
             if mask is not None:
                 mask = mask.unsqueeze(-1).unsqueeze(-1)
                 self.attn_ = torch.softmax(scores, dim = -1)  # (batch, head, time1, time2)
@@ -194,7 +195,56 @@ class MultiHeadedAttention(nn.Module):
                 scores = scores.masked_fill(mask == 0, MIN_VALUE)
             self.attn_ = torch.softmax(scores, dim = -1)  # (batch, head, time1, time2)
         p_attn = self.dropout(self.attn_)
-        # TODO make this unfold_dot: (batch, head, time1, restrict) x (batch, self.h, time1, self.restrict, self.d_k)
         x = torch.matmul(p_attn, v)  # (batch, head, time1, d_k)
         x = x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
         return self.linear_out(x) # (batch, time1, d_model)
+
+
+class MultiHeadedAttention(RefMultiHeadedAttention):
+
+    def forward(self, query, key, value, mask):
+        """Compute 'Scaled Dot Product Attention'
+        :param torch.Tensor query: (batch, time1, size)
+        :param torch.Tensor key: (batch, time2, size)
+        :param torch.Tensor value: (batch, time2, size)
+        :param torch.Tensor mask: (batch, time1)
+        :param torch.nn.Dropout dropout:
+        :return torch.Tensor: attentined and transformed `value` (batch, time1, d_model)
+             weighted by the query dot key attention (batch, head, time1, time2)
+        """
+        n_batch = query.size(0)
+        q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
+        k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k)
+        v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k)
+        q = q.transpose(1, 2)  # (batch, head, time1, d_k)
+        k = k.transpose(1, 2)  # (batch, head, time2, d_k)
+        v = v.transpose(1, 2)  # (batch, head, time2, d_k)
+
+        if self.restrict > 0:
+            # (batch, head, time1, 1, d_k) x (batch, head, time1, d_k, self.restrict) -> (batch, head, time1, 1, self.restrict)
+            scores = unfold_dot(q, k, self.restrict).unsqueeze(3) / math.sqrt(self.d_k)
+            if mask is not None:
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                self.attn_ = torch.softmax(scores, dim = -1)  # (batch, head, time1, time2)
+                self.attn_ = self.attn_.masked_fill(mask == 0, 0)
+            self.attn_ = torch.softmax(scores, dim = -1)  # (batch, head, time1, time2)
+            p_attn = self.dropout(self.attn_)
+            # (batch, head, time1, restrict) x (batch, self.h, time1, (self.restrict,) self.d_k)
+            x = unfold_matmul(p_attn.squeeze(3), v)  # (batch, head, time1, d_k)
+            # NOTE: do not need contiguous here because unfold_matmul does transpose in advance
+            x = x.transpose(1, 2).view(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
+            return self.linear_out(x) # (batch, time1, d_model)
+        else:
+            # (batch, head, time1, d_k) x (batch, head, d_k, time2) -> (batch, head, time1, time2)
+            scores = q.matmul(k.transpose(-2, -1)) / math.sqrt(self.d_k)
+            if mask is not None:
+                mask = mask.unsqueeze(1)
+                scores = scores.masked_fill(mask == 0, MIN_VALUE)
+            self.attn_ = torch.softmax(scores, dim = -1)  # (batch, head, time1, time2)
+            p_attn = self.dropout(self.attn_)
+            x = torch.matmul(p_attn, v)  # (batch, head, time1, d_k)
+            x = x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
+            return self.linear_out(x) # (batch, time1, d_model)
+
+    def reference_forward(self, query, key, value, mask):
+        return super().forward(query, key, value, mask)
